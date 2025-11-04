@@ -228,3 +228,106 @@ namespace VtcClient47
 
 Let me know if you want any of these enhancements or have a specific error to troubleshoot!
 
+That error means the TLS handshake failed before HTTP started. For Visa’s mTLS APIs, it’s almost always one of these: missing/invalid client cert, wrong TLS protocol, untrusted Visa CA, missing private key in the cert, or a proxy/inspection issue. Do the checks below in order.
+
+Quick fixes to try first
+- Force TLS 1.2+ in .NET Framework 4.7:
+  - Put this at the very start of Main (before any request):
+    ServicePointManager.SecurityProtocol = SecurityProtocolType.Tls12 | SecurityProtocolType.Tls13; // Tls13 ignored on .NET 4.7 but harmless
+- Load a valid client PFX that includes the private key:
+  - Ensure the file truly has the private key. When you open the .pfx in certmgr.msc MMC, it should show “You have a private key that corresponds to this certificate.”
+- Use the correct Visa project client certificate:
+  - The cert must belong to the Visa Developer project that is enabled for the VTC API. A wrong project cert will fail the client-auth handshake.
+- Make sure you’re hitting the right endpoint:
+  - Sandbox: https://sandbox.api.visa.com/vtc/...
+- Temporarily log SSL errors:
+  - In your handler, log ex.ToString() for any HttpRequestException and show InnerException chain.
+
+Recommended robust setup for .NET Framework 4.7
+1) TLS version and cipher suites
+- .NET 4.7 defaults should negotiate TLS 1.2 automatically, but set:
+  ServicePointManager.SecurityProtocol = SecurityProtocolType.Tls12;
+- If your OS has TLS 1.2 disabled via policy, enable it or update to a modern Windows build with current cipher suites.
+
+2) Client certificate loading
+- Prefer loading the PFX with MachineKeySet when running under non-interactive users (services/agents):
+  var cert = new X509Certificate2(pfxPath, pfxPassword, X509KeyStorageFlags.MachineKeySet | X509KeyStorageFlags.Exportable);
+- Verify it has a private key:
+  if (!cert.HasPrivateKey) throw new InvalidOperationException("Client certificate has no private key.");
+- Check expiry:
+  if (DateTime.UtcNow < cert.NotBefore || DateTime.UtcNow > cert.NotAfter) throw new InvalidOperationException("Client certificate expired or not yet valid.");
+
+3) Trust chain for server verification
+- Install Visa’s root and intermediate CAs into Local Computer:
+  - Trusted Root Certification Authorities (root)
+  - Intermediate Certification Authorities (intermediate)
+- Do not disable server validation in production. If you previously set:
+  handler.ServerCertificateCustomValidationCallback = (sender, cert, chain, errors) => true;
+  remove that line and fix trust properly.
+
+4) Attach the certificate to HttpClient
+var handler = new HttpClientHandler
+{
+    ClientCertificateOptions = ClientCertificateOption.Manual
+};
+handler.ClientCertificates.Add(cert);
+using (var http = new HttpClient(handler)) { ... }
+
+5) Corporate proxy/SSL inspection
+- If you are behind a proxy that performs SSL inspection, the mTLS handshake will fail because the proxy can’t forward your client cert to Visa. Options:
+  - Bypass the proxy for *.visa.com or the specific hosts.
+  - Configure HttpClient to use the proxy and set it to not intercept those domains.
+  - Test from a network without SSL interception (quick validation).
+
+6) Correct endpoint and method
+- Example URL:
+  var url = "https://sandbox.api.visa.com/vtc/programadmin/v1/sponsors/configuration";
+- Do not send a body with GET. Only Accept: application/json is fine.
+
+7) Convert PEM to PFX correctly (if needed)
+- If you received PEM files:
+  openssl pkcs12 -export -in client_cert.pem -inkey client_key.pem -out client-cert.pfx -name "visa-client"
+- Ensure the client_key.pem matches the cert. A mismatched key will cause handshake failure.
+
+8) Validate the certificate in Windows store (optional approach)
+- Import the PFX into Current User → Personal → Certificates (or Local Computer if service account).
+- Then pick it by thumbprint:
+  var store = new X509Store(StoreName.My, StoreLocation.CurrentUser);
+  store.Open(OpenFlags.ReadOnly);
+  var matches = store.Certificates.Find(X509FindType.FindByThumbprint, "YOUR_THUMBPRINT_NO_SPACES", validOnly: false);
+  if (matches.Count == 0) throw new Exception("Cert not found in store");
+  var certFromStore = matches[0];
+  handler.ClientCertificates.Add(certFromStore);
+
+9) Add Basic Auth or other headers only after TLS is good
+- Auth headers don’t affect TLS handshakes. Fix TLS first, then add:
+  request.Headers.Authorization = new AuthenticationHeaderValue("Basic", base64Creds);
+
+Minimal hardened code snippet (drop-in for your .NET 4.7 app)
+- Put at the top of Main:
+ServicePointManager.SecurityProtocol = SecurityProtocolType.Tls12;
+- Replace your certificate loading with:
+var cert = new X509Certificate2(pfxPath, pfxPassword, X509KeyStorageFlags.MachineKeySet | X509KeyStorageFlags.Exportable);
+if (!cert.HasPrivateKey) throw new InvalidOperationException("Client certificate lacks private key.");
+var handler = new HttpClientHandler { ClientCertificateOptions = ClientCertificateOption.Manual };
+handler.ClientCertificates.Add(cert);
+// Remove any handler.ServerCertificateCustomValidationCallback that returns true.
+using (var client = new HttpClient(handler) { Timeout = TimeSpan.FromSeconds(30) })
+{
+    var request = new HttpRequestMessage(HttpMethod.Get, url);
+    request.Headers.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
+    var response = client.SendAsync(request).Result;
+    // handle response...
+}
+
+Targeted troubleshooting checklist
+- A. Cert mismatch: Are you sure the PFX belongs to the same Visa developer project/CSR used for VTC? Try another known-good client cert if available.
+- B. Wrong password: Check for “The specified network password is not correct” when loading cert—means bad PFX password.
+- C. Missing private key: HasPrivateKey == false => rebuild PFX with the right key.
+- D. Expired cert: NotAfter < now => renew/recreate in Visa Developer.
+- E. Proxy: Temporarily test on a different network or bypass proxy for sandbox.api.visa.com.
+- F. CA trust: Ensure server chain builds to a trusted CA; remove any blanket “accept all certs” and install proper roots.
+- G. SChannel event logs: Check Windows Event Viewer → Applications and Services Logs → Microsoft → Windows → Schannel for precise handshake errors (e.g., unknown CA, bad certificate, handshake failure, no shared cipher).
+
+If you paste the exact InnerException or the SChannel event ID/message, I can pinpoint the cause and give a precise fix. Also, tell me whether your cert came as PFX or PEMs and whether you’re behind a corporate proxy.
+
